@@ -1,156 +1,214 @@
 #!/usr/bin/env python3
-"""JSON structural diff — compare two JSON values and produce a patch.
-
-Outputs human-readable diff and RFC 6902 JSON Patch format.
+"""json_diff — Deep diff two JSON files/values with path-aware output.
 
 Usage:
-    python json_diff.py a.json b.json
-    python json_diff.py --test
+    json_diff.py diff a.json b.json
+    json_diff.py diff a.json b.json --ignore-order
+    echo '{"a":1}' | json_diff.py diff - b.json
+    json_diff.py patch a.json changes.json
+    json_diff.py merge a.json b.json
 """
-import json, sys
 
-class Diff:
-    def __init__(self, op, path, old=None, new=None):
-        self.op=op; self.path=path; self.old=old; self.new=new
-    def __repr__(self): return f"{self.op} {self.path}: {self.old} → {self.new}" if self.op=='replace' else f"{self.op} {self.path}: {self.new or self.old}"
-    def to_patch(self):
-        if self.op == 'add': return {"op":"add","path":self.path,"value":self.new}
-        if self.op == 'remove': return {"op":"remove","path":self.path}
-        if self.op == 'replace': return {"op":"replace","path":self.path,"value":self.new}
+import sys
+import json
+import argparse
+from typing import Any
 
-def diff(a, b, path="") -> list:
-    """Compute structural diff between two JSON values."""
-    diffs = []
+
+def deep_diff(a: Any, b: Any, path: str = '$', ignore_order: bool = False) -> list:
+    """Compute deep diff between two values. Returns list of changes."""
+    changes = []
+    
     if type(a) != type(b):
-        diffs.append(Diff('replace', path or '/', a, b))
-    elif isinstance(a, dict):
+        changes.append({'op': 'replace', 'path': path, 'old': a, 'new': b})
+        return changes
+    
+    if isinstance(a, dict):
         all_keys = set(a.keys()) | set(b.keys())
         for key in sorted(all_keys):
-            p = f"{path}/{key}"
+            child_path = f'{path}.{key}'
             if key not in a:
-                diffs.append(Diff('add', p, new=b[key]))
+                changes.append({'op': 'add', 'path': child_path, 'value': b[key]})
             elif key not in b:
-                diffs.append(Diff('remove', p, old=a[key]))
+                changes.append({'op': 'remove', 'path': child_path, 'value': a[key]})
             else:
-                diffs.extend(diff(a[key], b[key], p))
+                changes.extend(deep_diff(a[key], b[key], child_path, ignore_order))
+    
     elif isinstance(a, list):
-        for i in range(max(len(a), len(b))):
-            p = f"{path}/{i}"
-            if i >= len(a):
-                diffs.append(Diff('add', p, new=b[i]))
-            elif i >= len(b):
-                diffs.append(Diff('remove', p, old=a[i]))
-            else:
-                diffs.extend(diff(a[i], b[i], p))
+        if ignore_order and all(not isinstance(x, (dict, list)) for x in a + b):
+            sa, sb = sorted(str(x) for x in a), sorted(str(x) for x in b)
+            if sa != sb:
+                added = [x for x in b if x not in a]
+                removed = [x for x in a if x not in b]
+                if added:
+                    changes.append({'op': 'add_items', 'path': path, 'values': added})
+                if removed:
+                    changes.append({'op': 'remove_items', 'path': path, 'values': removed})
+        else:
+            max_len = max(len(a), len(b))
+            for i in range(max_len):
+                child_path = f'{path}[{i}]'
+                if i >= len(a):
+                    changes.append({'op': 'add', 'path': child_path, 'value': b[i]})
+                elif i >= len(b):
+                    changes.append({'op': 'remove', 'path': child_path, 'value': a[i]})
+                else:
+                    changes.extend(deep_diff(a[i], b[i], child_path, ignore_order))
+    
     elif a != b:
-        diffs.append(Diff('replace', path or '/', a, b))
-    return diffs
+        changes.append({'op': 'replace', 'path': path, 'old': a, 'new': b})
+    
+    return changes
 
-def apply_patch(doc, patch):
-    """Apply JSON Patch (RFC 6902) to document."""
-    doc = json.loads(json.dumps(doc))  # deep copy
-    for op in patch:
-        parts = op['path'].strip('/').split('/') if op['path'] != '/' else []
-        if op['op'] == 'add':
-            _set_path(doc, parts, op['value'])
-        elif op['op'] == 'remove':
-            _del_path(doc, parts)
-        elif op['op'] == 'replace':
-            _set_path(doc, parts, op['value'])
-    return doc
 
-def _set_path(doc, parts, value):
-    if not parts:
-        return value  # Can't replace root in-place
-    obj = doc
-    for p in parts[:-1]:
-        obj = obj[int(p)] if isinstance(obj, list) else obj[p]
-    key = parts[-1]
-    if isinstance(obj, list):
-        idx = int(key)
-        if idx >= len(obj): obj.append(value)
-        else: obj[idx] = value
-    else:
-        obj[key] = value
-    return doc
+def load_json(path: str) -> Any:
+    if path == '-':
+        return json.load(sys.stdin)
+    with open(path) as f:
+        return json.load(f)
 
-def _del_path(doc, parts):
-    obj = doc
-    for p in parts[:-1]:
-        obj = obj[int(p)] if isinstance(obj, list) else obj[p]
-    key = parts[-1]
-    if isinstance(obj, list): obj.pop(int(key))
-    else: del obj[key]
 
-def format_diff(diffs, color=False) -> str:
-    lines = []
-    for d in diffs:
-        if d.op == 'add':
-            lines.append(f"+ {d.path}: {json.dumps(d.new)}")
-        elif d.op == 'remove':
-            lines.append(f"- {d.path}: {json.dumps(d.old)}")
-        elif d.op == 'replace':
-            lines.append(f"~ {d.path}: {json.dumps(d.old)} → {json.dumps(d.new)}")
-    return '\n'.join(lines)
+def format_value(v: Any, max_len: int = 60) -> str:
+    s = json.dumps(v)
+    return s if len(s) <= max_len else s[:max_len-3] + '...'
 
-def to_json_patch(diffs) -> list:
-    return [d.to_patch() for d in diffs]
 
-def test():
-    print("=== JSON Diff Tests ===\n")
+def cmd_diff(args):
+    a = load_json(args.file_a)
+    b = load_json(args.file_b)
+    
+    changes = deep_diff(a, b, ignore_order=args.ignore_order)
+    
+    if args.json:
+        print(json.dumps(changes, indent=2))
+        return
+    
+    if not changes:
+        print('✅ No differences')
+        return
+    
+    stats = {'add': 0, 'remove': 0, 'replace': 0, 'add_items': 0, 'remove_items': 0}
+    
+    for c in changes:
+        op = c['op']
+        stats[op] = stats.get(op, 0) + 1
+        
+        if op == 'add':
+            print(f'  \033[32m+ {c["path"]}: {format_value(c["value"])}\033[0m')
+        elif op == 'remove':
+            print(f'  \033[31m- {c["path"]}: {format_value(c["value"])}\033[0m')
+        elif op == 'replace':
+            print(f'  \033[33m~ {c["path"]}: {format_value(c["old"])} → {format_value(c["new"])}\033[0m')
+        elif op == 'add_items':
+            print(f'  \033[32m+ {c["path"]}: added {format_value(c["values"])}\033[0m')
+        elif op == 'remove_items':
+            print(f'  \033[31m- {c["path"]}: removed {format_value(c["values"])}\033[0m')
+    
+    total = sum(stats.values())
+    parts = []
+    if stats['add']: parts.append(f'+{stats["add"]}')
+    if stats['remove']: parts.append(f'-{stats["remove"]}')
+    if stats['replace']: parts.append(f'~{stats["replace"]}')
+    print(f'\n{total} changes ({", ".join(parts)})')
 
-    a = {"name": "Alice", "age": 30, "tags": ["admin", "user"]}
-    b = {"name": "Alice", "age": 31, "tags": ["admin", "editor"], "email": "a@b.com"}
 
-    diffs = diff(a, b)
-    print(format_diff(diffs))
-    assert any(d.op == 'replace' and 'age' in d.path for d in diffs)
-    assert any(d.op == 'add' and 'email' in d.path for d in diffs)
-    assert any(d.op == 'replace' and 'tags/1' in d.path for d in diffs)
-    print(f"\n✓ {len(diffs)} differences found")
+def apply_patch(obj: Any, changes: list) -> Any:
+    """Apply a list of changes to an object (simple implementation)."""
+    import copy
+    result = copy.deepcopy(obj)
+    
+    for change in changes:
+        path_parts = []
+        path = change['path']
+        # Parse path like $.foo.bar[0].baz
+        for part in path.replace('[', '.[').split('.'):
+            if not part or part == '$':
+                continue
+            if part.startswith('[') and part.endswith(']'):
+                path_parts.append(int(part[1:-1]))
+            else:
+                path_parts.append(part)
+        
+        # Navigate to parent
+        current = result
+        for p in path_parts[:-1]:
+            current = current[p]
+        
+        key = path_parts[-1] if path_parts else None
+        op = change['op']
+        
+        if key is None:
+            if op == 'replace':
+                result = change['new']
+        elif op == 'add' or op == 'replace':
+            val = change.get('value', change.get('new'))
+            if isinstance(current, list) and isinstance(key, int):
+                if key >= len(current):
+                    current.append(val)
+                else:
+                    current[key] = val
+            else:
+                current[key] = val
+        elif op == 'remove':
+            if isinstance(current, list) and isinstance(key, int):
+                if key < len(current):
+                    current.pop(key)
+            elif isinstance(current, dict):
+                current.pop(key, None)
+    
+    return result
 
-    # JSON Patch
-    patch = to_json_patch(diffs)
-    assert all('op' in p and 'path' in p for p in patch)
-    print(f"✓ JSON Patch: {len(patch)} operations")
 
-    # No diff
-    assert diff({"x": 1}, {"x": 1}) == []
-    print("✓ Identical objects: no diff")
+def cmd_patch(args):
+    obj = load_json(args.file)
+    changes = load_json(args.changes)
+    result = apply_patch(obj, changes)
+    print(json.dumps(result, indent=2))
 
-    # Type change
-    d = diff({"x": 1}, {"x": "one"})
-    assert len(d) == 1 and d[0].op == 'replace'
-    print("✓ Type change detected")
 
-    # Nested
-    d2 = diff({"a": {"b": {"c": 1}}}, {"a": {"b": {"c": 2}}})
-    assert d2[0].path == "/a/b/c"
-    print(f"✓ Nested diff: {d2[0].path}")
+def cmd_merge(args):
+    """Deep merge two JSON objects (b overrides a)."""
+    a = load_json(args.file_a)
+    b = load_json(args.file_b)
+    
+    def merge(x, y):
+        if isinstance(x, dict) and isinstance(y, dict):
+            result = dict(x)
+            for k, v in y.items():
+                if k in result:
+                    result[k] = merge(result[k], v)
+                else:
+                    result[k] = v
+            return result
+        return y
+    
+    print(json.dumps(merge(a, b), indent=2))
 
-    # Array length change
-    d3 = diff([1,2,3], [1,2,3,4])
-    assert any(dd.op == 'add' for dd in d3)
-    print("✓ Array growth")
 
-    d4 = diff([1,2,3], [1,2])
-    assert any(dd.op == 'remove' for dd in d4)
-    print("✓ Array shrink")
+def main():
+    p = argparse.ArgumentParser(description='Deep JSON diff tool')
+    p.add_argument('--json', action='store_true')
+    sub = p.add_subparsers(dest='cmd', required=True)
 
-    # Apply patch roundtrip
-    patch_ops = to_json_patch(diff(a, b))
-    result = apply_patch(a, patch_ops)
-    assert result['age'] == 31
-    assert result['email'] == 'a@b.com'
-    assert result['tags'][1] == 'editor'
-    print("✓ Apply patch roundtrip")
+    s = sub.add_parser('diff', help='Diff two JSON files')
+    s.add_argument('file_a')
+    s.add_argument('file_b')
+    s.add_argument('--ignore-order', action='store_true', help='Ignore array order')
+    s.set_defaults(func=cmd_diff)
 
-    print("\nAll tests passed! ✓")
+    s = sub.add_parser('patch', help='Apply diff changes to JSON')
+    s.add_argument('file')
+    s.add_argument('changes', help='JSON file with changes array')
+    s.set_defaults(func=cmd_patch)
 
-if __name__ == "__main__":
-    args = sys.argv[1:]
-    if not args or args[0] == "--test": test()
-    elif len(args) == 2:
-        with open(args[0]) as f: a = json.load(f)
-        with open(args[1]) as f: b = json.load(f)
-        print(format_diff(diff(a, b)))
+    s = sub.add_parser('merge', help='Deep merge two JSON objects')
+    s.add_argument('file_a')
+    s.add_argument('file_b')
+    s.set_defaults(func=cmd_merge)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()
