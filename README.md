@@ -1,6 +1,6 @@
 # json-diff
 
-JSON structural diff tool
+JSON Structural Diff. Zero-dependency, single-file Python CLI.
 
 ## Usage
 
@@ -8,7 +8,6 @@ JSON structural diff tool
 python3 json_diff.py --help
 ```
 
-## Features
+## License
 
-- Zero dependencies (Python 3.8+)
-- Single file implementation
+MIT
