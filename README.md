@@ -1,13 +1,17 @@
-# json-diff
+# json_diff
 
-JSON Structural Diff. Zero-dependency, single-file Python CLI.
+JSON diff tool showing structural differences
+
+Single-file, zero-dependency Python CLI tool.
 
 ## Usage
 
 ```bash
-python3 json_diff.py --help
+python json_diff.py --help
 ```
 
-## License
+## Test
 
-MIT
+```bash
+python -c "import json_diff; json_diff.test()"
+```

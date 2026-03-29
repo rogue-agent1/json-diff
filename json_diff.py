@@ -1,51 +1,76 @@
 #!/usr/bin/env python3
-"""JSON Diff - Deep structural comparison of JSON documents."""
-import sys, json
+"""JSON structural diff."""
 
-class Diff:
-    def __init__(self, kind, path, old=None, new=None):
-        self.kind = kind; self.path = path; self.old = old; self.new = new
-    def __repr__(self):
-        if self.kind == "added": return f"+ {self.path}: {json.dumps(self.new)}"
-        if self.kind == "removed": return f"- {self.path}: {json.dumps(self.old)}"
-        if self.kind == "changed": return f"~ {self.path}: {json.dumps(self.old)} -> {json.dumps(self.new)}"
-        if self.kind == "type_changed": return f"! {self.path}: type {type(self.old).__name__} -> {type(self.new).__name__}"
-        return f"? {self.path}"
-
-def json_diff(a, b, path=""):
+def diff(a, b, path=""):
     diffs = []
     if type(a) != type(b):
-        diffs.append(Diff("type_changed", path or "/", a, b)); return diffs
+        diffs.append({"path": path, "op": "type_change", "old": repr(a), "new": repr(b)})
+        return diffs
     if isinstance(a, dict):
-        for key in set(list(a.keys()) + list(b.keys())):
-            p = f"{path}/{key}"
-            if key not in a: diffs.append(Diff("added", p, new=b[key]))
-            elif key not in b: diffs.append(Diff("removed", p, old=a[key]))
-            else: diffs.extend(json_diff(a[key], b[key], p))
+        all_keys = set(a.keys()) | set(b.keys())
+        for k in sorted(all_keys):
+            p = f"{path}.{k}" if path else k
+            if k not in a:
+                diffs.append({"path": p, "op": "add", "value": b[k]})
+            elif k not in b:
+                diffs.append({"path": p, "op": "remove", "value": a[k]})
+            else:
+                diffs.extend(diff(a[k], b[k], p))
     elif isinstance(a, list):
         for i in range(max(len(a), len(b))):
-            p = f"{path}/{i}"
-            if i >= len(a): diffs.append(Diff("added", p, new=b[i]))
-            elif i >= len(b): diffs.append(Diff("removed", p, old=a[i]))
-            else: diffs.extend(json_diff(a[i], b[i], p))
-    elif a != b:
-        diffs.append(Diff("changed", path or "/", a, b))
+            p = f"{path}[{i}]"
+            if i >= len(a):
+                diffs.append({"path": p, "op": "add", "value": b[i]})
+            elif i >= len(b):
+                diffs.append({"path": p, "op": "remove", "value": a[i]})
+            else:
+                diffs.extend(diff(a[i], b[i], p))
+    else:
+        if a != b:
+            diffs.append({"path": path, "op": "change", "old": a, "new": b})
     return diffs
 
-def main():
-    if len(sys.argv) >= 3:
-        with open(sys.argv[1]) as f: a = json.load(f)
-        with open(sys.argv[2]) as f: b = json.load(f)
-    else:
-        a = {"name": "App", "version": "1.0", "deps": {"lodash": "4.0", "react": "17"}, "scripts": ["build", "test"]}
-        b = {"name": "App", "version": "2.0", "deps": {"lodash": "4.1", "vue": "3"}, "scripts": ["build", "test", "lint"], "type": "module"}
-    diffs = json_diff(a, b)
-    print(f"=== JSON Diff ({len(diffs)} changes) ===\n")
-    for d in diffs: print(f"  {d}")
-    added = sum(1 for d in diffs if d.kind == "added")
-    removed = sum(1 for d in diffs if d.kind == "removed")
-    changed = sum(1 for d in diffs if d.kind in ("changed", "type_changed"))
-    print(f"\nSummary: +{added} -{removed} ~{changed}")
+def format_diff(diffs):
+    lines = []
+    for d in diffs:
+        if d["op"] == "add":
+            lines.append(f"+ {d['path']}: {d['value']}")
+        elif d["op"] == "remove":
+            lines.append(f"- {d['path']}: {d['value']}")
+        elif d["op"] == "change":
+            lines.append(f"~ {d['path']}: {d['old']} -> {d['new']}")
+        elif d["op"] == "type_change":
+            lines.append(f"! {d['path']}: {d['old']} -> {d['new']}")
+    return "\n".join(lines)
+
+def are_equal(a, b):
+    return len(diff(a, b)) == 0
 
 if __name__ == "__main__":
-    main()
+    import json
+    a = {"name": "old", "items": [1, 2]}
+    b = {"name": "new", "items": [1, 3], "extra": True}
+    print(format_diff(diff(a, b)))
+
+def test():
+    # Equal
+    assert diff({"a": 1}, {"a": 1}) == []
+    assert are_equal([1, 2], [1, 2])
+    # Changes
+    d = diff({"a": 1, "b": 2}, {"a": 1, "b": 3, "c": 4})
+    assert len(d) == 2
+    ops = {x["op"] for x in d}
+    assert "change" in ops and "add" in ops
+    # Removal
+    d2 = diff({"a": 1, "b": 2}, {"a": 1})
+    assert d2[0]["op"] == "remove"
+    # Array
+    d3 = diff([1, 2, 3], [1, 4, 3, 5])
+    assert len(d3) == 2  # change at [1], add at [3]
+    # Type change
+    d4 = diff({"x": 1}, {"x": "one"})
+    assert d4[0]["op"] == "type_change"
+    # Format
+    f = format_diff(d)
+    assert "~" in f or "+" in f
+    print("  json_diff: ALL TESTS PASSED")
